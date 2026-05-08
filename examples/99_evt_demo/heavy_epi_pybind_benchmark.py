@@ -6,15 +6,21 @@ Fused op (identical for every variant):
 
 Dtype variants
 --------------
-  * bf16          : A/B are bf16.  TWO kernels are benchmarked side-by-side:
+  * bf16          : A/B are bf16.  THREE kernels are benchmarked side-by-side:
                       - ``heavy_epi_torch_ext.cu``    : CUTLASS 2.x **Sm80**
                         EVT (Ampere-class MMA, runs on sm_120 via backward
                         compat).
                       - ``heavy_epi_90_torch_ext.cu`` : CUTLASS 3.x **Sm90**
                         EVT (CollectiveBuilder + Sm90EVT, built with
                         compute_90a PTX so it JITs onto sm_120 at launch).
-                    Both expose the same ``heavy_epi_matmul_out(A,B,br,sc,Aux,D)``
-                    entry, so the bench just calls each from its own module.
+                      - ``120_90evt_heavy_epi_torch_ext.cu`` : CUTLASS 3.x
+                        **arch::Sm120 + Sm90EVT**.  Sm120 dense MMA is
+                        F8F6F4-only, so this column quantises the bf16 A/B
+                        to FP8 E4M3 *outside* the timed region and then runs
+                        the heavy epilogue on the Sm120 mainloop.
+                    The Sm80/Sm90 columns expose ``heavy_epi_matmul_out
+                    (A,B,br,sc,Aux,D)``; the Sm120 column adds (M,N,K) and
+                    takes packed-uint8 A/B.
   * fp8_e4m3 / fp8_e5m2 / fp6_e3m2 / fp6_e2m3 / fp4_e2m1
                   : A/B are Blackwell narrow-precision types.  Kernel is in
                     ``heavy_epi_low_precision_torch_ext.cu`` (CUTLASS 3.x
@@ -113,6 +119,34 @@ def build_extension_bf16_90(verbose: bool = False):
     return load(
         name="heavy_epi_90_torch_ext",
         sources=[os.path.join(HERE, "heavy_epi_90_torch_ext.cu")],
+        extra_include_paths=[
+            os.path.join(CUTLASS_ROOT, "include"),
+            os.path.join(CUTLASS_ROOT, "tools", "util", "include"),
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=verbose,
+    )
+
+
+def build_extension_bf16_120_90evt(verbose: bool = False, arch: str = "120"):
+    """Build the ``arch::Sm120 + Sm90EVT`` heavy-epilogue extension.
+
+    The Sm120 dense F8F6F4 MMA only compiles when targeting ``sm_<arch>a``
+    (the ``a`` suffix), same as the multi-dtype low-precision kernel.  A/B
+    on the kernel side are FP8 E4M3 packed uint8; the Python bench feeds
+    them by quantising bf16 A/B once before the timed region.
+    """
+    arch_a = f"{arch}a"
+    extra_cuda_cflags = [
+        "-std=c++17",
+        "-O3",
+        "--expt-relaxed-constexpr",
+        f"-gencode=arch=compute_{arch_a},code=sm_{arch_a}",
+    ]
+    return load(
+        name="heavy_epi_120_90evt_ext",
+        sources=[os.path.join(HERE, "120_90evt_heavy_epi_torch_ext.cu")],
         extra_include_paths=[
             os.path.join(CUTLASS_ROOT, "include"),
             os.path.join(CUTLASS_ROOT, "tools", "util", "include"),
@@ -233,6 +267,26 @@ def alloc_packed_bytes(numel: int, bits: int,
                          generator=generator)
 
 
+def quantize_bf16_to_e4m3_bytes(A_bf16: torch.Tensor,
+                                B_bf16: torch.Tensor
+                                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert bf16 A (M,K) RowMajor and B (K,N) RowMajor into the byte
+    layout the Sm120 F8F6F4 kernel expects: A as (M*K,) uint8 RowMajor and
+    B as (K*N,) uint8 ColumnMajor (because the Sm120 builder requires TN).
+
+    Done with PyTorch's native ``float8_e4m3fn`` cast (saturating, RNE on
+    GPU); bit-pattern is then re-viewed as uint8 for the C++ side.  This
+    runs once per shape, outside the timed region, so it doesn't affect
+    benchmark numbers.
+    """
+    A_fp8 = A_bf16.contiguous().to(torch.float8_e4m3fn)
+    A_bytes = A_fp8.view(torch.uint8).reshape(-1).contiguous()
+    # B (K,N) RowMajor ->  (N,K) RowMajor (= K-major ColumnMajor over (K,N))
+    B_fp8 = B_bf16.contiguous().to(torch.float8_e4m3fn)
+    B_bytes = B_fp8.t().contiguous().view(torch.uint8).reshape(-1).contiguous()
+    return A_bytes, B_bytes
+
+
 def alignment_ok(M: int, N: int, K: int, bits: int) -> bool:
     """Shape alignment requirements enforced by the sm_120 F8F6F4 builder.
 
@@ -271,6 +325,9 @@ def main() -> None:
     ap.add_argument("--force-sm90", action="store_true",
                     help="Force-build the Sm90-EVT extension on non-Hopper devices "
                          "(launches will device-side-assert in WGMMA stubs)")
+    ap.add_argument("--no-sm120", action="store_true",
+                    help="Skip the arch::Sm120 + Sm90EVT FP8-E4M3 extension "
+                         "(build + bench)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -296,8 +353,19 @@ def main() -> None:
               f"WGMMA mainloop requires sm_90 (H100). Pass --force-sm90 to attempt anyway.",
               flush=True)
 
+    # Sm120 + Sm90EVT path requires sm_120 (or higher) for the F8F6F4 MMA.
+    # Auto-skip on non-Blackwell-consumer parts; the user can still bench
+    # Sm80/Sm90 columns alone.
+    is_blackwell_consumer = (major == 12)
+    want_sm120 = need_bf16 and not args.no_sm120 and is_blackwell_consumer
+    if need_bf16 and not args.no_sm120 and not is_blackwell_consumer:
+        print(f"NOTE: skipping arch::Sm120 + Sm90EVT extension — device is sm_{major}{minor}, "
+              f"F8F6F4 dense MMA requires sm_120 (Blackwell-consumer).",
+              flush=True)
+
     ext_bf16 = None
     ext_bf16_90 = None
+    ext_bf16_120_90evt = None
     ext_lp = None
     if need_bf16:
         print(f"Building CUTLASS bf16 Sm80-EVT extension (arch=sm_{args.arch}) ...", flush=True)
@@ -306,6 +374,12 @@ def main() -> None:
     if want_sm90:
         print("Building CUTLASS bf16 Sm90-EVT extension (sm_90a + sm_120a) ...", flush=True)
         ext_bf16_90 = build_extension_bf16_90(verbose=args.verbose_build)
+        print("  built.", flush=True)
+    if want_sm120:
+        print(f"Building CUTLASS arch::Sm120 + Sm90EVT FP8-E4M3 extension "
+              f"(arch=sm_{args.arch}a) ...", flush=True)
+        ext_bf16_120_90evt = build_extension_bf16_120_90evt(
+            verbose=args.verbose_build, arch=args.arch)
         print("  built.", flush=True)
     if low_prec:
         print(f"Building CUTLASS F8F6F4 EVT extension (arch=sm_{args.arch}a) ...", flush=True)
@@ -349,6 +423,22 @@ def main() -> None:
                 f"Correctness (bf16 Sm90-EVT) on ({M0},{N0},{K0}): "
                 f"max|diff|={diff90.max().item():.4f}, "
                 f"mean|diff|={diff90.mean().item():.5f}, rel={rel90:.2e}",
+                flush=True,
+            )
+        if want_sm120:
+            # FP8 E4M3 quantisation introduces real numeric error vs bf16
+            # reference (E4M3 has ~3 mantissa bits); print it for visibility.
+            A_bytes0, B_bytes0 = quantize_bf16_to_e4m3_bytes(A, B)
+            D_cutlass120 = torch.empty((M0, N0), dtype=torch.bfloat16, device=dev)
+            ext_bf16_120_90evt.heavy_epi_matmul_out(
+                A_bytes0, B_bytes0, br, sc, Aux, D_cutlass120, M0, N0, K0)
+            diff120 = (D_cutlass120.float() - D_ref.float()).abs()
+            rel120 = (diff120.mean() / max(1e-6, D_ref.float().abs().mean().item())).item()
+            print(
+                f"Correctness (Sm120 + Sm90EVT, FP8 E4M3 A/B) on ({M0},{N0},{K0}): "
+                f"max|diff|={diff120.max().item():.4f}, "
+                f"mean|diff|={diff120.mean().item():.5f}, rel={rel120:.2e} "
+                f"(quantisation noise expected)",
                 flush=True,
             )
         if compiled_fn is not None:
@@ -399,14 +489,37 @@ def main() -> None:
         ]
         if want_sm90:
             header_cells.append(f" {'CUT-90 ms':>11} {'CUT-90 TF':>11}")
+        if want_sm120:
+            # Sm120 path takes FP8 A/B but the user-facing inputs are bf16,
+            # so we report three numbers per shape:
+            #   kern ms : pre-quantised inputs, kernel only
+            #   Q ms    : bf16 -> FP8 E4M3 conversion of *both* A and B
+            #   +Q ms   : kern + Q (the apples-to-apples cost vs the bf16
+            #             baseline, which would also start from bf16 A/B)
+            # +Q TF is the effective throughput counting the quant cost.
+            header_cells.append(
+                f" {'CUT-120 kern':>13} {'Q ms':>9} {'CUT-120 +Q ms':>15} {'+Q TF':>9}")
         header_cells += [
             f" {'vs eager':>9} {'vs compile':>11}",
         ]
         if want_sm90:
             header_cells.append(f" {'90 vs 80':>9}")
+        if want_sm120:
+            header_cells.append(f" {'120+Q vs 80':>12}")
         header = "".join(header_cells)
-        print("\n[bf16 heavy-epilogue GEMM — Sm80-EVT vs Sm90-EVT]"
-              if want_sm90 else "\n[bf16 heavy-epilogue GEMM]")
+        title_bits = ["Sm80-EVT"]
+        if want_sm90:
+            title_bits.append("Sm90-EVT")
+        if want_sm120:
+            title_bits.append("Sm120+Sm90EVT(FP8E4M3, +bf16->FP8 quant)")
+        print(f"\n[bf16 heavy-epilogue GEMM — {' vs '.join(title_bits)}]"
+              if (want_sm90 or want_sm120) else "\n[bf16 heavy-epilogue GEMM]")
+        if want_sm120:
+            print("  Sm120 columns: kern = kernel only (pre-quantised inputs); "
+                  "Q = bf16->FP8 of A and B; +Q = kern+Q (fair vs Sm80 bf16)."
+                  "\n  +Q assumes B is quantised per call too; in real LLM "
+                  "inference weights can be cached and only A pays Q.",
+                  flush=True)
         print(header)
         print("-" * len(header))
 
@@ -419,6 +532,17 @@ def main() -> None:
             D   = torch.empty((M, N), dtype=torch.bfloat16, device=dev)
             D90 = (torch.empty((M, N), dtype=torch.bfloat16, device=dev)
                    if want_sm90 else None)
+            D120 = (torch.empty((M, N), dtype=torch.bfloat16, device=dev)
+                    if want_sm120 else None)
+            # Sm120 path consumes packed FP8 bytes.  Pre-quantise once for
+            # the kernel-only timing, but ALSO time the bf16->FP8 conversion
+            # (timed inside cutlass120_quant_fn / cutlass120_full_fn below)
+            # so the comparison vs the bf16 Sm80 column is apples-to-apples.
+            bench_sm120 = want_sm120 and alignment_ok(M, N, K, bits=8)
+            if bench_sm120:
+                A_bytes_120, B_bytes_120 = quantize_bf16_to_e4m3_bytes(A, B)
+            else:
+                A_bytes_120 = B_bytes_120 = None
 
             def cutlass_fn():
                 ext_bf16.heavy_epi_matmul_out(A, B, br, sc, Aux, D)
@@ -443,18 +567,52 @@ def main() -> None:
             else:
                 cutlass90_ms = float("nan")
 
-            cutlass_tf   = gemm_tflops(cutlass_ms,   M, N, K)
-            eager_tf     = gemm_tflops(eager_ms,     M, N, K)
-            compile_tf   = (gemm_tflops(compile_ms, M, N, K)
-                            if compile_ms == compile_ms else float("nan"))
-            cutlass90_tf = (gemm_tflops(cutlass90_ms, M, N, K)
-                            if cutlass90_ms == cutlass90_ms else float("nan"))
+            if bench_sm120:
+                # Kernel-only: pre-quantised buffers reused across iters.
+                def cutlass120_kern_fn(_A=A_bytes_120, _B=B_bytes_120, _D=D120):
+                    ext_bf16_120_90evt.heavy_epi_matmul_out(
+                        _A, _B, br, sc, Aux, _D, M, N, K)
+                cutlass120_kern_ms = bench(cutlass120_kern_fn, args.warmup, args.iters)
+
+                # Quant-only: bf16 -> FP8 E4M3 of A and B, no kernel.  This
+                # is the cost the Sm80 baseline does NOT pay (it consumes
+                # bf16 directly).
+                def cutlass120_quant_fn(_A=A, _B=B):
+                    quantize_bf16_to_e4m3_bytes(_A, _B)
+                cutlass120_q_ms = bench(cutlass120_quant_fn, args.warmup, args.iters)
+
+                # Full pipeline: fresh quant + kernel each iter.  This is
+                # the apples-to-apples cost vs the bf16 Sm80 column.
+                def cutlass120_full_fn(_A=A, _B=B, _D=D120):
+                    a_b, b_b = quantize_bf16_to_e4m3_bytes(_A, _B)
+                    ext_bf16_120_90evt.heavy_epi_matmul_out(
+                        a_b, b_b, br, sc, Aux, _D, M, N, K)
+                cutlass120_full_ms = bench(cutlass120_full_fn, args.warmup, args.iters)
+            else:
+                cutlass120_kern_ms = float("nan")
+                cutlass120_q_ms    = float("nan")
+                cutlass120_full_ms = float("nan")
+
+            cutlass_tf         = gemm_tflops(cutlass_ms,   M, N, K)
+            eager_tf           = gemm_tflops(eager_ms,     M, N, K)
+            compile_tf         = (gemm_tflops(compile_ms, M, N, K)
+                                  if compile_ms == compile_ms else float("nan"))
+            cutlass90_tf       = (gemm_tflops(cutlass90_ms, M, N, K)
+                                  if cutlass90_ms == cutlass90_ms else float("nan"))
+            cutlass120_full_tf = (gemm_tflops(cutlass120_full_ms, M, N, K)
+                                  if cutlass120_full_ms == cutlass120_full_ms
+                                  else float("nan"))
 
             speedup_e   = eager_ms   / cutlass_ms
             speedup_c   = (compile_ms / cutlass_ms
                            if compile_ms == compile_ms else float("nan"))
             speedup_90  = (cutlass_ms / cutlass90_ms
                            if cutlass90_ms == cutlass90_ms else float("nan"))
+            # Speedup vs Sm80 uses the FULL (kern+Q) cost — this is what an
+            # actual replacement of the bf16 Sm80 path would pay.
+            speedup_120 = (cutlass_ms / cutlass120_full_ms
+                           if cutlass120_full_ms == cutlass120_full_ms
+                           else float("nan"))
 
             row = (
                 f"({M},{N},{K}):".ljust(22)
@@ -468,6 +626,14 @@ def main() -> None:
                 row += (f" {cutlass90_ms:>11.3f} {cutlass90_tf:>11.1f}"
                         if cutlass90_ms == cutlass90_ms else
                         f" {'n/a':>11} {'n/a':>11}")
+            if want_sm120:
+                if cutlass120_full_ms == cutlass120_full_ms:
+                    row += (f" {cutlass120_kern_ms:>13.3f}"
+                            f" {cutlass120_q_ms:>9.3f}"
+                            f" {cutlass120_full_ms:>15.3f}"
+                            f" {cutlass120_full_tf:>9.1f}")
+                else:
+                    row += (f" {'n/a':>13} {'n/a':>9} {'n/a':>15} {'n/a':>9}")
             row += (
                 f" {speedup_e:>8.2f}x"
                 + (f" {speedup_c:>10.2f}x"
@@ -476,6 +642,9 @@ def main() -> None:
             if want_sm90:
                 row += (f" {speedup_90:>8.2f}x"
                         if speedup_90 == speedup_90 else f" {'n/a':>9}")
+            if want_sm120:
+                row += (f" {speedup_120:>11.2f}x"
+                        if speedup_120 == speedup_120 else f" {'n/a':>12}")
             print(row, flush=True)
 
     # Table 2: Low-precision CUTLASS comparison.  For every shape we time
